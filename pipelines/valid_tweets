@@ -1,0 +1,69 @@
+import dlt
+from pyspark.sql.functions import col, trim, when, udf
+from pyspark.sql.types import DoubleType, StringType
+from textblob import TextBlob
+
+# ----------------------------
+# UDF 1: TextBlob sentiment score
+# ----------------------------
+def get_textblob_sentiment(text: str) -> float:
+    if not text:
+        return 0.0
+    return float(TextBlob(text).sentiment.polarity)
+
+textblob_udf = udf(get_textblob_sentiment, DoubleType())
+
+# ----------------------------
+# UDF 2: Categorize sentiment score
+# ----------------------------
+def categorize_sentiment(score: float) -> str:
+    if score >= 0.6:
+        return "strong positive"
+    elif score > 0.1:
+        return "positive"
+    elif score > -0.1:
+        return "neutral"
+    elif score > -0.6:
+        return "negative"
+    else:
+        return "strong negative"
+
+categorize_udf = udf(categorize_sentiment, StringType())
+
+# ----------------------------
+# Read Bronze table function
+# ----------------------------
+def read_bronze(bronze_table: str):
+    return dlt.read(bronze_table).filter(
+        col("tweet").isNotNull() & col("user_id").isNotNull()
+    )
+
+# ----------------------------
+# Silver Table
+# ----------------------------
+@dlt.table(
+    name="valid_tweets",
+    comment="Silver table: cleaned tweets with ML predictions from Bronze + TextBlob sentiment"
+)
+def silver_table():
+    bronze_df = read_bronze("tweet_data")
+
+    return (
+        bronze_df
+        # Human-readable sentiment from label
+        .withColumn(
+            "sentiment_label",
+            when(col("label") == 1, "positive")
+            .when(col("label") == 0, "negative")
+            .otherwise("neutral")
+        )
+        # TextBlob numeric sentiment score
+        .withColumn("sentiment_score", textblob_udf(col("tweet")))
+        # Sentiment category
+        .withColumn("sentiment_category", categorize_udf(col("sentiment_score")))
+        # Discrepancy between label and ML prediction already in Bronze
+        .withColumn("discrepancy",
+        when(col("sentiment_label") != col("sentiment_category"), True).otherwise(False))
+        # Clean tweet text
+        .withColumn("tweet", trim(col("tweet")))
+    )
